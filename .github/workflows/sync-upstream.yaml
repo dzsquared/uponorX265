@@ -1,0 +1,97 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily at 10:23 UTC, away from the busy start of the hour.
+    - cron: "23 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'dzsquared/uponorX265'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          git remote add upstream https://github.com/dave-code-ruiz/uponorX265.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          before_sha=$(git rev-parse HEAD)
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream main is already included; no changes needed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-edit "$upstream_sha"; then
+            echo "::error::Upstream merge failed. Resolve conflicts manually; remote main was not changed."
+            echo "Upstream merge failed; remote main was not changed. Resolve conflicts manually." >> "$GITHUB_STEP_SUMMARY"
+            git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+            git merge --abort || true
+            exit 1
+          fi
+
+          # A normal push preserves fork commits and rejects concurrent updates.
+          if ! git push origin HEAD:refs/heads/main; then
+            echo "::error::Push failed. Check repository permissions, branch rules, or concurrent updates. No force push was attempted."
+            echo "Push failed; check permissions, branch rules, or concurrent updates. No force push was attempted." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "Merged upstream main ($upstream_sha) into the fork's main."
+            echo "Previous main: $before_sha"
+            echo "Updated main: $(git rev-parse HEAD)"
+            echo "Existing validation workflows will be dispatched against main."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize failure
+        if: failure()
+        run: echo "Upstream sync failed. See the failed step's logs for details." >> "$GITHUB_STEP_SUMMARY"
+
+  validate:
+    name: Dispatch ${{ matrix.workflow }}
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        workflow: [test.yaml, validate.yaml, hassfest.yaml]
+    steps:
+      # GITHUB_TOKEN pushes do not trigger push workflows, so dispatch explicitly.
+      - name: Dispatch validation on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW: ${{ matrix.workflow }}
+        run: |
+          gh workflow run "$WORKFLOW" --ref main
+          echo "Dispatched $WORKFLOW on main. Check its workflow run for the validation result." >> "$GITHUB_STEP_SUMMARY"
